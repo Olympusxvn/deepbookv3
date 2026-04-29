@@ -28,14 +28,12 @@ use sui::{
 use fun df::exists_ as UID.exists_;
 use fun df::add as UID.add;
 
-// === Errors ===
 const EPredictAlreadyCreated: u64 = 0;
 const EInvalidTickSize: u64 = 1;
 const EInvalidStrikeGrid: u64 = 2;
 const EFeedIdOverflow: u64 = 3;
 
-// === Events ===
-
+/// Emitted when an oracle and its strike grid are registered.
 public struct OracleCreated has copy, drop, store {
     oracle_id: ID,
     oracle_cap_id: ID,
@@ -46,7 +44,15 @@ public struct OracleCreated has copy, drop, store {
     tick_size: u64,
 }
 
-// === Structs ===
+public struct CapRegistered has copy, drop, store {
+    oracle_id: ID,
+    cap_id: ID,
+}
+
+public struct CapUnregistered has copy, drop, store {
+    oracle_id: ID,
+    cap_id: ID,
+}
 
 /// Capability for admin operations.
 /// Created during package init, transferred to deployer (multisig).
@@ -67,15 +73,6 @@ public struct PredictCreated() has copy, drop, store;
 
 // === Public Functions ===
 
-/// Get oracle IDs created by a given OracleSVICap.
-public fun oracle_ids(registry: &Registry, cap_id: ID): vector<ID> {
-    if (registry.oracle_ids.contains(cap_id)) {
-        registry.oracle_ids[cap_id]
-    } else {
-        vector[]
-    }
-}
-
 /// Create the Predict shared object for `Quote`. V1 allows exactly one
 /// Predict total via the `PredictCreated` marker; the per-`Quote` lock in
 /// `predict::create` would take over if that guard is ever dropped.
@@ -92,9 +89,26 @@ entry fun create_predict<Quote>(
     predict::create<Quote>(&mut registry.id, currency, treasury_cap, clock, ctx);
 }
 
-/// Register an additional OracleSVICap as authorized to update an oracle.
-public fun register_oracle_cap(oracle: &mut OracleSVI, _admin_cap: &AdminCap, cap: &OracleSVICap) {
-    oracle::register_cap(oracle, cap);
+/// Revoke an OracleSVICap's authorization on an oracle. Takes `cap_id` so the
+/// admin can revoke caps that are no longer held (e.g. lost or compromised).
+public fun unregister_oracle_cap(oracle: &mut OracleSVI, _admin_cap: &AdminCap, cap_id: ID) {
+    oracle::unregister_cap(oracle, cap_id);
+    event::emit(CapUnregistered { oracle_id: object::id(oracle), cap_id });
+}
+
+/// Cap holder voluntarily removes its own cap from an oracle's authorized
+/// set. No AdminCap needed — possession of the cap is the authorization.
+public fun self_unregister_oracle_cap(oracle: &mut OracleSVI, cap: &OracleSVICap) {
+    let cap_id = object::id(cap);
+    oracle::self_unregister_cap(oracle, cap);
+    event::emit(CapUnregistered { oracle_id: object::id(oracle), cap_id });
+}
+
+/// Destroy an OracleSVICap the holder no longer needs. Does not touch any
+/// oracle's authorized set — self_unregister_oracle_cap first if cleanup is
+/// wanted.
+public fun destroy_oracle_cap(cap: OracleSVICap) {
+    oracle::destroy_oracle_cap(cap);
 }
 
 /// Create a new OracleSVICap. Transferred to Block Scholes operator.
@@ -154,6 +168,12 @@ public fun create_oracle(
     });
 
     oracle_id
+}
+
+/// Register an additional OracleSVICap as authorized to update an oracle.
+public fun register_oracle_cap(oracle: &mut OracleSVI, _admin_cap: &AdminCap, cap: &OracleSVICap) {
+    oracle::register_cap(oracle, cap);
+    event::emit(CapRegistered { oracle_id: object::id(oracle), cap_id: object::id(cap) });
 }
 
 /// Enable a quote asset for new supply and mint inflows.
@@ -336,8 +356,18 @@ public fun create_manager(registry: &mut Registry, ctx: &mut TxContext): Predict
     predict_manager::new(&mut registry.id, ctx)
 }
 
+/// Create and share a new PredictManager for the caller.
 entry fun create_and_share_manager(registry: &mut Registry, ctx: &mut TxContext) {
     create_manager(registry, ctx).share();
+}
+
+/// Get oracle IDs created by a given OracleSVICap.
+public fun oracle_ids(registry: &Registry, cap_id: ID): vector<ID> {
+    if (registry.oracle_ids.contains(cap_id)) {
+        registry.oracle_ids[cap_id]
+    } else {
+        vector[]
+    }
 }
 
 // === Private Functions ===
@@ -349,6 +379,7 @@ fun init(ctx: &mut TxContext) {
     transfer::transfer(admin_cap, ctx.sender());
 }
 
+/// Validate the initial oracle strike grid supplied by the operator.
 fun assert_valid_strike_grid(min_strike: u64, tick_size: u64) {
     assert!(tick_size > 0, EInvalidTickSize);
     assert!(tick_size % constants::oracle_tick_size_unit!() == 0, EInvalidTickSize);
@@ -356,22 +387,7 @@ fun assert_valid_strike_grid(min_strike: u64, tick_size: u64) {
     assert!(min_strike % tick_size == 0, EInvalidStrikeGrid);
 }
 
-// === Test Functions ===
-#[test_only]
-public fun init_for_testing(ctx: &mut TxContext): ID {
-    let (registry, admin_cap) = new_registry_and_admin_cap(ctx);
-    let registry_id = object::id(&registry);
-    transfer::share_object(registry);
-    transfer::transfer(admin_cap, ctx.sender());
-
-    registry_id
-}
-
-#[test_only]
-public fun create_admin_cap_for_testing(ctx: &mut TxContext): AdminCap {
-    AdminCap { id: object::new(ctx) }
-}
-
+/// Construct registry and admin cap during package init or tests.
 fun new_registry_and_admin_cap(ctx: &mut TxContext): (Registry, AdminCap) {
     (
         Registry {
@@ -382,4 +398,23 @@ fun new_registry_and_admin_cap(ctx: &mut TxContext): (Registry, AdminCap) {
             id: object::new(ctx),
         },
     )
+}
+
+// === Test-Only Functions ===
+
+#[test_only]
+/// Initialize registry and admin cap for tests, returning the registry ID.
+public fun init_for_testing(ctx: &mut TxContext): ID {
+    let (registry, admin_cap) = new_registry_and_admin_cap(ctx);
+    let registry_id = object::id(&registry);
+    transfer::share_object(registry);
+    transfer::transfer(admin_cap, ctx.sender());
+
+    registry_id
+}
+
+#[test_only]
+/// Create an admin cap for tests.
+public fun create_admin_cap_for_testing(ctx: &mut TxContext): AdminCap {
+    AdminCap { id: object::new(ctx) }
 }
